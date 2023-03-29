@@ -1,0 +1,20 @@
+{
+  "name": "bsa-arb-unijoe",
+  "version": "0.0.1",
+  "description": "EVM L2 Arbitrage Bot (between uniswap and traderjoe)",
+  "main": "index.ts",
+  "author": "squaaa",
+  "license": "MIT",
+  "dependencies": {
+    "@apollo/client": "^3.7.10",
+    "@uniswap/v3-periphery": "^1.4.3",
+    "dotenv": "^16.0.3",
+    "graphql-tag": "^2.12.6",
+    "react": "^18.2.0",
+    "ts-node": "^10.9.1",
+    "viem": "^0.1.22"
+  },
+  "scripts": {
+    "bot": "npx ts-node index.ts"
+  }
+}
