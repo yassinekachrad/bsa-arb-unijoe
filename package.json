@@ -17,6 +17,6 @@
     "viem": "^0.1.22"
   },
   "scripts": {
-    "bot": "npx ts-node index.ts"
+    "bot": "ts-node src/index.ts"
   }
 }
