@@ -1,11 +1,13 @@
 // 1. Import modules.
 import { Address, createPublicClient, http, PublicClient, webSocket, decodeAbiParameters } from 'viem'
 import { mainnet, arbitrum } from 'viem/chains'
-import { getPools, Pool, getQuote as UniV3getQuote, Token } from './uniswap-utils/pools';
-import { ApolloClient, NormalizedCacheObject, InMemoryCache } from '@apollo/client';
+import { getUniswapPools, getQuote as UniV3getQuote } from './uniswap-utils/pools';
 import { univ3PoolAbi } from './uniswap-utils/pool-abi';
-
+import { AMM, displayTokenAmount, Pool, printPoolData, Token, TokenAmount } from './utils';
+import { getTraderJoePools } from './traderjoe-utils/pools';
 require('dotenv').config();
+
+const MIN_USD_POOL_VALUE = 1000;
 
 // 2. Set up your client with desired chain & transport.
 const client = createPublicClient({
@@ -13,51 +15,81 @@ const client = createPublicClient({
     transport: webSocket(process.env.RPC_URL_WS),
 });
 
-// Create Apollo Client
-const apolloClient: ApolloClient<NormalizedCacheObject> = new ApolloClient({
-    uri: 'https://api.thegraph.com/subgraphs/name/ianlapham/arbitrum-minimal',
-    cache: new InMemoryCache()
-});
-
-// Update the price of a pool
-const updatePoolPrice = async (pool: Pool, client: PublicClient) => {
-    const data: any = (await client.readContract({
-        address: pool.id,
-        abi: univ3PoolAbi,
-        functionName: 'slot0',
-    }));
-    const sqrtPriceX96: BigInt = data[0];
-    pool.sqrtPriceX96 = sqrtPriceX96;
-}
-
 (async function () {
-    // get pools
-    const POOLS: Pool[] = await getPools(client, apolloClient);
 
-    console.log(`Number of interesting pools: ${Object.keys(POOLS).length}`);
+    // ------------------ Uniswap ------------------
+    // get pools
+    const uniswapPools: Pool[] = await getUniswapPools(MIN_USD_POOL_VALUE);
+
+    console.log(`Number of interesting uniswap pools: ${Object.keys(uniswapPools).length}`);
 
     // get the price of each pool and put them in a dictionary
-    for (const pool of POOLS) {
-        await updatePoolPrice(pool, client);
+    for (const pool of uniswapPools) {
+        if (pool.fetchPoolPrice !== undefined) await pool.fetchPoolPrice(client);
     }
 
-    console.log("Pool data fetched. Subscribing to price updates...");
-
-    // Subscribe to price updates
-    for (const pool of POOLS) {
+    console.log("Uniswap Pool data fetched. Subscribing to swap events...");
+    
+    // (uniswap) Subscribe to price updates
+    for (const pool of uniswapPools) {
         const unwatch = client.watchContractEvent({
             address: pool.id,
             abi: univ3PoolAbi,
             eventName: 'Swap',
-            onLogs: logs => reactToPriceChange(logs, pool, client),
+            onLogs: logs => onSwapEventUniswap(logs, pool, client),
         });
     }
+
+    // ------------------ TraderJoe ------------------
+    // get pools
+    const traderJoePools: Pool[] = await getTraderJoePools(MIN_USD_POOL_VALUE);
+
+    console.log(`Number of interesting traderjoe pools: ${Object.keys(traderJoePools).length}`);
+
+    // get the price of each pool and put them in a dictionary
+    for (const pool of traderJoePools) {
+        if (pool.fetchPoolPrice !== undefined) await pool.fetchPoolPrice(client);
+    }
+
+    console.log("TraderJoe Pool data fetched. Subscribing to swap events...");
+    
+    // (traderjoe) Subscribe to price updates
+    for (const pool of traderJoePools) {
+        // TODO: Add swap event subscription
+    }
+
+    // dictionary token0 -> token1 -> pool[] (for arbitrage search)
+    let poolsGraph: { [token0: string]: { [token1: string]: Pool[] } } = {};
+
+    // add uniswap pools to the graph
+    for (const pool of uniswapPools) {
+        if (!(pool.token0.symbol in poolsGraph)) poolsGraph[pool.token0.symbol] = {};
+        if (!(pool.token1.symbol in poolsGraph[pool.token0.symbol])) poolsGraph[pool.token0.symbol][pool.token1.symbol] = [];
+        poolsGraph[pool.token0.symbol][pool.token1.symbol].push(pool);
+    }
+
+    // add traderjoe pools to the graph
+    for (const pool of traderJoePools) {
+        if (!(pool.token0.symbol in poolsGraph)) poolsGraph[pool.token0.symbol] = {};
+        if (!(pool.token1.symbol in poolsGraph[pool.token0.symbol])) poolsGraph[pool.token0.symbol][pool.token1.symbol] = [];
+        poolsGraph[pool.token0.symbol][pool.token1.symbol].push(pool);
+    }
+
+    // test quote uniswap USDT -> USDC (fee 0.3%)
+    let pools: Pool[];
+    if ((pools = poolsGraph['USDT']['USDC'].filter(pool => pool.feePercentage == 0.01 && pool.amm == AMM.UNISWAP && pool.quoteAmountOut !== undefined)).length == 1) {
+        const pool = pools[0];
+        const tokenIn = pool.token0.symbol == 'USDT' ? pool.token0 : pool.token1;
+        const tokenAmountIn: TokenAmount = {token: tokenIn, amount: BigInt(1 * 10 ** tokenIn.decimals)};
+        const quote = await pool.quoteAmountOut!(client, tokenAmountIn);
+        console.log(`Quote ${displayTokenAmount(tokenAmountIn)} USDT -> ${displayTokenAmount(quote)} USDC`);
+    }
+     else {
+        console.log(poolsGraph['USDT']['USDC']);
+     }
 })();
 
-// 3. Define a function to react to price changes.
-const reactToPriceChange = async (logs: any, pool: Pool, client: PublicClient) => {
-
-
+const onSwapEventUniswap = async (logs: any, pool: Pool, client: PublicClient) => {
     // Decode the event log.
     const eventData = decodeAbiParameters(
         [
@@ -68,21 +100,8 @@ const reactToPriceChange = async (logs: any, pool: Pool, client: PublicClient) =
             { name: 'tick', type: 'int24' },
         ],
         logs[0].data);
-
     pool.sqrtPriceX96 = eventData[2];
-    pool.liquidity = eventData[3];
-    
     printPoolData(pool);
 }
 
-// Convert a sqrtPriceX96 to a price
-const sqrtPriceToPrice = (sqrtPriceX96: BigInt, token0: Token, token1: Token) => {
-    let sqrtPrice = parseFloat(sqrtPriceX96.toString()) / parseFloat((BigInt(2)**BigInt(96)).toString());
-    let price = sqrtPrice * sqrtPrice / 10**(token1.decimals - token0.decimals);
-    return price;
-}
-
-// Pretty print pool data
-const printPoolData = (pool: Pool) => {
-    console.log(`Pool ${pool.id} (${pool.token0.symbol}/${pool.token1.symbol}) has price ${sqrtPriceToPrice(pool.sqrtPriceX96!, pool.token0, pool.token1).toFixed(6)}`);
-}
+// TODO: Make a function to look for arbitrage opportunities from the lists of pools (simple uniswap <-> traderjoe arbitrage)
