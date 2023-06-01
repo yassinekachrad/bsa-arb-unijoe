@@ -1,3 +1,5 @@
 .env
 node_modules/
 .vscode/
+contracts/cache/
+contracts/out/
